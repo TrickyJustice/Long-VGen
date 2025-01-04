@@ -1,8 +1,1 @@
-time-lapse of a blooming flower with leaves and a stem
-a bonfire is lit in the middle of a field
-a woman looking out in the rain
-rotating view, small house
-pouring honey onto some slices of bread
-a sailboat sailing in rough seas with a dramatic sunset 
-a boat traveling on the ocean
-a group of penguins walking on a beach
+a robot is walking through a destroyed city, keep the input image as the first frame. Ensure consistent leg and arm motion paths to maintain smooth walking continuity between sequences.

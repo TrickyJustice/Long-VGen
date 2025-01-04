@@ -9,6 +9,165 @@ import torchvision
 sys.path.insert(1, os.path.join(sys.path[0], '..', '..'))
 from lvdm.models.samplers.ddim import DDIMSampler
 from einops import rearrange
+from tqdm import tqdm
+
+###############################
+# Upsampling function
+def upsample_noise(X, N, device = None):
+    b, c, h, w = X.shape
+    Z = torch.randn(b, c, N * h, N * w, device=device)
+    Z_mean = Z.unfold(2, N, N).unfold(3, N, N).mean(dim=(4, 5))
+    Z_mean = F.interpolate(Z_mean, scale_factor=N, mode='nearest')
+    X = F.interpolate(X, scale_factor=N, mode='nearest')
+    return X / N + Z - Z_mean
+
+# Vectorized triangulate_area function
+def triangulate_area_batch(A_batch, s):
+    """
+    A_batch: Tensor of shape (N, 2, 2), where N = H * W (number of pixels)
+    s: Number of subdivisions
+    Returns:
+    - V_batch: Tensor of shape (N, (s+1)*(s+1), 2)
+    - F: Tensor of shape (2*s*s, 3)
+    """
+    N = A_batch.shape[0]
+    device = A_batch.device
+
+    # Generate subdivision points for one pixel
+    lin = torch.linspace(0, 1, s + 1, device=device)
+    grid_x, grid_y = torch.meshgrid(lin, lin, indexing='ij')
+    grid = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=1)  # Shape: ((s+1)*(s+1), 2)
+
+    # Compute vertices for all pixels
+    A_min = A_batch[:, 0].unsqueeze(1)  # Shape: (N, 1, 2)
+    A_max = A_batch[:, 1].unsqueeze(1)  # Shape: (N, 1, 2)
+    V_batch = A_min + grid.unsqueeze(0) * (A_max - A_min)  # Shape: (N, (s+1)*(s+1), 2)
+
+    # Faces are the same for all pixels
+    F = []
+    for i in range(s):
+        for j in range(s):
+            idx = i * (s + 1) + j
+            F.append([idx, idx + 1, idx + s + 1])
+            F.append([idx + 1, idx + s + 2, idx + s + 1])
+    F = torch.tensor(F, device=device)  # Shape: (2*s*s, 3)
+
+    return V_batch, F
+
+# Vectorized warp_vertices function
+def warp_vertices_batch(vertices_batch, T_func):
+    """
+    vertices_batch: Tensor of shape (N, M, 2)
+    Returns:
+    - warped_vertices_batch: Tensor of shape (N, M, 2)
+    """
+    N, M, _ = vertices_batch.shape
+    vertices_flat = vertices_batch.view(-1, 2)  # Shape: (N*M, 2)
+    warped_vertices_flat = T_func(vertices_flat)
+    warped_vertices_batch = warped_vertices_flat.view(N, M, 2)
+    return warped_vertices_batch
+
+# Vectorized rasterize function
+def rasterize_batch(vertices_batch, shape):
+    """
+    vertices_batch: Tensor of shape (N, M, 2)
+    shape: Output shape (B, C, Hk, Wk)
+    Returns:
+    - mask: Tensor of shape (N, Hk, Wk)
+    """
+    N, M, _ = vertices_batch.shape
+    _, _, Hk, Wk = shape
+    device = vertices_batch.device
+
+    # Initialize masks
+    mask = torch.zeros(N, Hk, Wk, dtype=torch.bool, device=device)
+
+    # Flatten coordinates
+    x = vertices_batch[..., 0].contiguous().view(-1).long()
+    y = vertices_batch[..., 1].contiguous().view(-1).long()
+    n_indices = torch.arange(N, device=device).repeat_interleave(M)
+
+    # Filter valid indices
+    valid = (x >= 0) & (x < Wk) & (y >= 0) & (y < Hk)
+    x = x[valid]
+    y = y[valid]
+    n_indices = n_indices[valid]
+
+    mask[n_indices, y, x] = True
+
+    return mask
+
+# Main function with vectorized operations
+def distribution_preserving_noise_warping_full_frame_parallel(G, T_func, k, s):
+    B, C, H, W = G.shape
+    device = G.device
+
+    # Upsample the noise
+    G_infinity = upsample_noise(G, k, device)  # Shape: (B, C, Hk, Wk)
+    Hk, Wk = H * k, W * k
+
+    # Generate grid of pixel positions
+    i_grid, j_grid = torch.meshgrid(torch.arange(H, device=device), torch.arange(W, device=device), indexing='ij')
+    i_grid = i_grid.flatten()
+    j_grid = j_grid.flatten()
+    N = H * W  # Number of pixels
+
+    # Define pixel areas for all pixels
+    A_min = torch.stack([j_grid.float(), i_grid.float()], dim=1)  # Shape: (N, 2)
+    A_max = A_min + 1  # Shape: (N, 2)
+    A_batch = torch.stack([A_min, A_max], dim=1)  # Shape: (N, 2, 2), N = H*W
+
+    # Triangulate areas
+    V_batch, Faces = triangulate_area_batch(A_batch, s)  # V_batch: (N, M, 2)
+
+    # Warp vertices
+    warped_V_batch = warp_vertices_batch(V_batch, T_func)  # Shape: (N, M, 2)
+
+    # Rasterize to get masks
+    masks = rasterize_batch(warped_V_batch, G_infinity.shape)  # Shape: (N, Hk, Wk)
+
+    # Compute pixel values
+    warped_G = torch.zeros_like(G)
+    for b in tqdm(range(B), desc="Batch Processing"):
+        for c in range(C):
+            G_inf_flat = G_infinity[b, c].view(-1)  # Shape: (Hk*Wk)
+            mask_flat = masks.view(N, -1)  # Shape: (N, Hk*Wk)
+            values = mask_flat.float().matmul(G_inf_flat.unsqueeze(1)).squeeze(1)  # Shape: (N,)
+            counts = mask_flat.sum(dim=1).float()  # Shape: (N,)
+            counts[counts == 0] = 1  # Avoid division by zero
+            pixel_values = values / torch.sqrt(counts)
+            warped_G[b, c] = pixel_values.view(H, W)
+
+    return warped_G
+
+# Function to generate the initial noise frame
+def generate_initial_noise_frame(channels, height, width, device = None):
+    """
+    Generates the initial noise frame.
+    """
+    return torch.randn((1, channels, height, width), device=device)
+
+# Function to initialize correlated noise frames
+def initialize_correlated_noise_frames(initial_frame, k, s, num_frames=128, dx=1, dy=1):
+    frames = []
+    G = initial_frame
+    B, C, H, W = G.shape
+
+    for frame_idx in tqdm(range(num_frames), desc="Frame Generation"):
+        def T_func(vertices):
+            transformed_vertices = vertices.clone()
+            transformed_vertices[:, 0] += dx * frame_idx  % W
+            transformed_vertices[:, 1] += dy * frame_idx  % H
+            return transformed_vertices
+            # return inverted_explosion_transportation(vertices, frame_idx, downward_strength, diffusion_scale, width, height)
+
+        warped_G = distribution_preserving_noise_warping_full_frame_parallel(G, T_func, k, s)
+        frames.append(warped_G)
+
+    frames = torch.stack(frames, dim=0)  # Shape: (num_frames, B, C, H, W)
+    return frames
+
+###############################
 
 
 def batch_ddim_sampling(model, cond, noise_shape, n_samples=1, ddim_steps=50, ddim_eta=1.0,\
@@ -50,7 +209,23 @@ def batch_ddim_sampling(model, cond, noise_shape, n_samples=1, ddim_steps=50, dd
     else:
         uc = None
     
-    x_T = None
+    print(noise_shape)
+    initial_frame = generate_initial_noise_frame(noise_shape[1], noise_shape[3], noise_shape[4], device = model.device)
+
+    # Define your T_func here
+    # ...
+
+    # Upsampling factor and polygon subdivision steps
+    k = 4
+    s = 2
+
+    # Generate the sequence of noise frames
+    x_T = initialize_correlated_noise_frames(
+        initial_frame, k, s, num_frames=noise_shape[2], dx=1, dy=0
+    )
+    x_T = rearrange(x_T, 'f b c h w -> b c f h w')
+    print(x_T.shape)
+    # x_T = None
     batch_variants = []
 
     for _ in range(n_samples):
